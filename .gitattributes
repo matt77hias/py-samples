@@ -1,0 +1,12 @@
+###############################################################################
+# Auto detect text files and perform LF normalization
+###############################################################################
+* text=auto
+
+###############################################################################
+# Explicitly declare CRLF normalization for the following files
+###############################################################################
+
+*.py		text eol=crlf
+
+Samples/** linguist-documentation=false
