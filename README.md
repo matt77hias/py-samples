@@ -6,4 +6,4 @@
 # py-samples
 
 ## About
-Samples for experimenting with various Python standards and features.
+Samples for prototyping and experimenting with various Python standards and features.
