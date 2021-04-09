@@ -67,35 +67,63 @@ def expand(world_min, world_max, world_min_delta, world_max_delta):
     world_size   = (world_max - world_min)
     o2w = object_to_world(world_size, world_center)
     
-    # object-to-world = S R T
-    # world-to-object = (S R T)^-1 = T^-1 R^-1 S^-1 = T^-1 R^T S^-1
+    # object-to-world =  S R T
+    # world-to-object = (S R T)^-1
+    #
+    #         T^-1              R^-1            S^-1
+    #         T^-1              R^T             S^-1 
+    # 
+    # [   1   0   0  0 ] [  .  .  .  0 ] [ 1/sx    0    0 0]
+    # [   0   1   0  0 ] [ R0 R1 R2  0 ] [    0 1/sy    0 0]
+    # [   0   0   1  0 ] [  .  .  .  0 ] [    0    0 1/sz 0]
+    # [ -tx -ty -tz  1 ] [  .  .  .  1 ] [    0    0    0 1]
+    #
+    #         T^-1              R^T S^-1   
+    #
+    # [   1   0   0  0 ] [   .     .     .    0 ]
+    # [   0   1   0  0 ] [ R0/sx R1/sy R2/sz  0 ]
+    # [   0   0   1  0 ] [   .     .     .    0 ]
+    # [ -tx -ty -tz  1 ] [   .     .     .    1 ]
+    #
+    # [      .        .        .    0 ]
+    # [    R0/sx    R1/sy    R2/sz  0 ]
+    # [      .        .        .    0 ]
+    # [ -t.R0/sx -t.R1/sy -t.R2/sz  1 ]
     
+    # Extract the old scaling component
     sx = np.linalg.norm(o2w[0])
     sy = np.linalg.norm(o2w[1])
     sz = np.linalg.norm(o2w[2])
     s  = np.array([sx, sy, sz])
+    # Expand the old scaling component
     new_s = s + (world_max_delta + world_min_delta)
     
+    # Compute the R^T S^-1 columns
     c0 = o2w[0] / (s[0] * new_s[0])
     c1 = o2w[1] / (s[1] * new_s[1])
     c2 = o2w[2] / (s[2] * new_s[2])
     
+    # Extract the old translation component
     t = o2w[3,:3]
+    # Extract the old translation component
     new_t = t + (world_max_delta - world_min_delta) / 2
     
+    # Compute the T^-1 R^T S^-1 columns
     c0[3] = np.dot(-new_t, c0[:3])
     c1[3] = np.dot(-new_t, c1[:3])
     c2[3] = np.dot(-new_t, c2[:3])
     
+    # Construct the expanded world-to-object
     new_w2o = np.zeros((4,4))
     new_w2o[:,0] = c0
     new_w2o[:,1] = c1
     new_w2o[:,2] = c2
     new_w2o[3,3] = 1.0
-    
+    # Validate the expanded world-to-object
     print(object_aabb(new_w2o, new_t - new_s/2, new_t + new_s/2))
     
 world_min = np.array([1.0, 2.0, 3.0])
 world_max = np.array([5.0, 6.0, 7.0])
 world_min_delta = np.array([1.0, 2.0, 3.0])
 world_max_delta = np.array([5.0, 6.0, 7.0])
+expand(world_min, world_max, world_min_delta, world_max_delta)
