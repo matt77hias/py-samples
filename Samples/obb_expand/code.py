@@ -1,3 +1,7 @@
+# Script for modifying the world-to-object transformation matrix of an Oriented
+# Bounding Box (OBB) to support expanding the OBB along its three canonical and
+# inversed canonical axes.
+
 import numpy as np
 
 def scaling(s):
