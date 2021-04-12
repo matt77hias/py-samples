@@ -109,7 +109,7 @@ def expand(world_min, world_max, world_min_delta, world_max_delta):
     
     # Extract the old translation component.
     t = o2w[3,:3]
-    # Extract the old translation component.
+    # Expand the old translation component.
     new_t = t + (world_max_delta - world_min_delta) / 2
     
     # Compute the T^-1 R^T S^-1 columns
