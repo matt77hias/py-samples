@@ -77,21 +77,21 @@ def expand(world_min, world_max, world_min_delta, world_max_delta):
     #         T^-1              R^-1            S^-1
     #         T^-1              R^T             S^-1 
     # 
-    # [   1   0   0  0 ] [  .  .  .  0 ] [ 1/sx    0    0 0]
+    # [   1   0   0  0 ] [  |  |  |  0 ] [ 1/sx    0    0 0]
     # [   0   1   0  0 ] [ R0 R1 R2  0 ] [    0 1/sy    0 0]
-    # [   0   0   1  0 ] [  .  .  .  0 ] [    0    0 1/sz 0]
-    # [ -tx -ty -tz  1 ] [  .  .  .  1 ] [    0    0    0 1]
+    # [   0   0   1  0 ] [  |  |  |  0 ] [    0    0 1/sz 0]
+    # [ -tx -ty -tz  1 ] [  0  0  0  1 ] [    0    0    0 1]
     #
     #         T^-1              R^T S^-1   
     #
-    # [   1   0   0  0 ] [   .     .     .    0 ]
+    # [   1   0   0  0 ] [   |     |     |    0 ]
     # [   0   1   0  0 ] [ R0/sx R1/sy R2/sz  0 ]
-    # [   0   0   1  0 ] [   .     .     .    0 ]
-    # [ -tx -ty -tz  1 ] [   .     .     .    1 ]
+    # [   0   0   1  0 ] [   |     |     |    0 ]
+    # [ -tx -ty -tz  1 ] [   0     0     0    1 ]
     #
-    # [      .        .        .    0 ]
+    # [      |        |        |    0 ]
     # [    R0/sx    R1/sy    R2/sz  0 ]
-    # [      .        .        .    0 ]
+    # [      |        |        |    0 ]
     # [ -t.R0/sx -t.R1/sy -t.R2/sz  1 ]
     
     # Extract the old scaling component
