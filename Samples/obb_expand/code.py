@@ -109,8 +109,19 @@ def expand(world_min, world_max, world_min_delta, world_max_delta):
     
     # Extract the old translation component.
     t = o2w[3,:3]
-    # Expand the old translation component.
-    new_t = t + (world_max_delta - world_min_delta) / 2
+    # Compute the new centroid (expressed in object space).
+    # p_object_new_min      = -(0.5 + world_min_delta / s)
+    # p_object_new_max      = +(0.5 + world_max_delta / s)
+    # p_object_new_centroid = 0.5 (p_object_new_max  + p_object_new_min)
+    # p_object_new_centroid = 0.5 (world_max_delta - world_min_delta) / s
+    p_object_new_centroid = 0.5 * (world_max_delta - world_min_delta) / s
+    # Compute the new centroid (expressed in world space).
+    # p_world_new_centroid  = p_object_new_centroid o2w
+    # p_world_new_centroid  = p_object_new_centroid S R T
+    # p_world_new_centroid  = 0.5 (world_max_delta - world_min_delta) R T
+    # p_world_new_centroid  = 0.5 (world_max_delta - world_min_delta) R + t
+    # Expand the old translation component (expressed in world space).
+    new_t = np.dot(p_object_new_centroid, o2w[:3,:3]) + t
     
     # Compute the T^-1 R^T S^-1 columns
     c0[3] = np.dot(-new_t, c0[:3])
