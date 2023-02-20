@@ -17,7 +17,6 @@ def _non_linear_Inv5PL(x, a, b, c, d, e):
     return c * np.power(np.power((a-d)/(x-d), 1.0/e) - 1.0, 1.0/b)
 def non_linear_Inv5PL(x, a, b, c, d, e):
     return c * np.power(np.power((a-d)/(x-d), e) - 1.0, b)   
-    
 
 def fit():
     alphas  = np.linspace(0.0, 1.0, 100000)
