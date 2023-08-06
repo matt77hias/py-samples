@@ -10,5 +10,10 @@ ydl_opts = {
     }]
 }
 
-with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-    error_code = ydl.download(urls)
+while(True):
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            error_code = ydl.download(urls)
+        break
+    except:
+        pass
