@@ -17,12 +17,4 @@ def download():
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         error_code = ydl.download(urls)
 
-if hidden_files:
-    download()
-else:
-  while(True):
-      try:
-          download()
-          break
-      except:
-          pass
+download()
