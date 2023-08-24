@@ -2,8 +2,11 @@ import yt_dlp
 
 urls = ['']
 
+hidden_files = False
+
 ydl_opts = {
-    'format_sort': ['ext:mp4:m4a']
+    'format_sort': ['ext:mp4:m4a'],
+	'ignoreerrors': hidden_files
 }
 
 def download():
