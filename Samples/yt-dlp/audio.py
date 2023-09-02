@@ -2,11 +2,9 @@ import yt_dlp
 
 urls = ['']
 
-hidden_files = False
-
 ydl_opts = {
     'format': 'm4a/bestaudio/best',
-    'ignoreerrors': hidden_files,
+    'ignoreerrors': True,
     'postprocessors': [{
         'key': 'FFmpegExtractAudio',
         'preferredcodec': 'm4a',
