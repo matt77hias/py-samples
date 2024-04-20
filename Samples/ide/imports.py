@@ -11,7 +11,6 @@ pattern_DXGI  = "I?DXGI_[A-Za-z0-9_:]+"
 
 patterns = [pattern_fmt, pattern_std, pattern_MAGE, pattern_D3D12, pattern_DXGI]
 
-
 def write_tokens(tokens):
     if len(tokens) == 0:
         return
@@ -50,7 +49,6 @@ def write_tokens(tokens):
             sys.stdout.write(token)
 
     sys.stdout.write('\n')
-
 
 def scan(path):
     print("//-----------------------------------------------------------------------------")
