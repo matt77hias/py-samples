@@ -3,7 +3,7 @@ import yt_dlp
 urls = ['']
 
 ydl_opts = {
-	#'cookiesfrombrowser': ('chrome',),
+	#'cookiesfrombrowser': ('firefox',),
     'format_sort': ['ext:mp4:m4a'],
 	'ignoreerrors': True
 }
