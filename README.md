@@ -8,4 +8,4 @@
 ## About
 Samples for prototyping and experimenting with various Python standards and features.
 
-<p align="center">Copyright © 2018-2024 Matthias Moulin. All Rights Reserved.</p>
+<p align="center">Copyright © 2018-2025 Matthias Moulin. All Rights Reserved.</p>
