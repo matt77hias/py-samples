@@ -6,6 +6,7 @@ ydl_opts = {
 	#'cookiesfrombrowser': ('firefox',),
     'format': 'm4a/bestaudio/best',
     'ignoreerrors': True,
+	'outtmpl': '%(autonumber)02d %(title)s.%(ext)s',
     'postprocessors': [{
         'key': 'FFmpegExtractAudio',
         'preferredcodec': 'm4a',
