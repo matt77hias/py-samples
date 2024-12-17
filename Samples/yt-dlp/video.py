@@ -5,7 +5,8 @@ urls = ['']
 ydl_opts = {
 	#'cookiesfrombrowser': ('firefox',),
     'format_sort': ['ext:mp4:m4a'],
-	'ignoreerrors': True
+    'ignoreerrors': True,
+    'outtmpl': '%(autonumber)02d %(title)s.%(ext)s'
 }
 
 def download():
