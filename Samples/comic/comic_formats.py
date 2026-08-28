@@ -63,8 +63,8 @@ def member_exts(path: Path) -> Counter:
 
 def collect_archives(root: Path, exts: set[str]) -> list[Path]:
     return sorted(
-        p for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in exts
+        (p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts),
+        key=lambda p: cl.natural_key(str(p)),
     )
 
 
@@ -86,7 +86,7 @@ def main():
         print("No CBR/CBZ files found.")
         return
 
-    filter_ext = f".{args.filter.lstrip('.')}" if args.filter else None
+    filter_ext = f".{args.filter.lstrip('.').lower()}" if args.filter else None
     totals: Counter = Counter()
     matches = 0
 

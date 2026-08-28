@@ -6,11 +6,40 @@ Thin CLI over comic_lib. See comic_lib.py for dependencies and behavior notes.
 """
 
 import argparse
+import itertools
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 import comic_lib as cl
+
+_print_lock = threading.Lock()
+
+
+class Result(Enum):
+    """Outcome of a single convert_file call, so main() can tally accurately."""
+    CONVERTED = "converted"
+    SKIPPED = "skipped"
+    DRY_CONVERT = "dry_convert"
+    DRY_SKIP = "dry_skip"
+
+
+@dataclass
+class ConvertOptions:
+    """Typed conversion options forwarded from the CLI to convert_file and cl.convert."""
+    quality: int = 90
+    pdf_dpi: int = 150
+    pdf_image_format: str = "jpeg"
+    pdf_color_mode: str = "color"
+    drop_first: int = 0
+    drop_last: int = 0
+    fill_missing: Optional[str] = None
+    overwrite: bool = False
+    dry_run: bool = False
 
 
 def infer_format(dest: Path, explicit: Optional[str]) -> str:
@@ -66,25 +95,36 @@ def collect_jobs(source: Path, dest: Path, out_fmt: str) -> list[tuple[Path, Pat
     return [(source, dest / source.with_suffix(f".{out_fmt}").name)]
 
 
-def convert_file(src: Path, dst: Path, out_fmt: str, args) -> None:
-    """Convert one file, honoring --overwrite and guarding against writing a
-    file onto itself. Delegates the actual work to comic_lib.convert."""
+def convert_file(src: Path, dst: Path, out_fmt: str, opts: ConvertOptions, log=print) -> Result:
+    """Convert one file, honoring opts.overwrite and guarding against writing a
+    file onto itself. Delegates the actual work to comic_lib.convert. Returns a
+    Result describing what happened so the caller can tally outcomes."""
     if src.resolve() == dst.resolve():
         raise cl.ConversionError("source and destination are the same file")
-    if dst.exists() and not args.overwrite:
-        print(f"  Skipping (exists): {dst}  (use --overwrite)")
-        return
+    if opts.dry_run:
+        if dst.exists() and not opts.overwrite:
+            log(f"  Would skip (exists): {dst.name}  (use --overwrite)")
+            return Result.DRY_SKIP
+        log(f"  Would convert: {src.name} -> {dst.name}")
+        return Result.DRY_CONVERT
+    if dst.exists() and not opts.overwrite:
+        log(f"  Skipping (exists): {dst.name}  (use --overwrite)")
+        return Result.SKIPPED
 
-    print(f"Converting: {src.name} -> {dst.name}")
+    log(f"Converting: {src.name} -> {dst.name}")
     n = cl.convert(
         src, dst, out_fmt,
-        quality=args.quality,
-        pdf_dpi=args.pdf_dpi,
-        drop_first=args.drop_first,
-        drop_last=args.drop_last,
-        fill_missing=args.fill_missing,
+        quality=opts.quality,
+        pdf_dpi=opts.pdf_dpi,
+        pdf_image_format=opts.pdf_image_format,
+        pdf_color_mode=opts.pdf_color_mode,
+        drop_first=opts.drop_first,
+        drop_last=opts.drop_last,
+        fill_missing=opts.fill_missing,
+        log=log,
     )
-    print(f"  Wrote {n} pages.")
+    log(f"  Wrote {n} {'page' if n == 1 else 'pages'}.")
+    return Result.CONVERTED
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,6 +138,13 @@ Examples:
   python comic_convert.py ./comics/ ./out/ --format cbz
   python comic_convert.py book.cbz book.pdf --drop-first 1 --drop-last 1 --fill-missing white
   python comic_convert.py book.pdf book.cbz --quality 95 --pdf-dpi 200
+  python comic_convert.py book.pdf book.cbz --pdf-image-format png
+  python comic_convert.py book.pdf book.cbz --pdf-image-format webp --quality 85
+  python comic_convert.py book.pdf book.cbz --pdf-color-mode greyscale
+  python comic_convert.py book.pdf book.cbz --pdf-color-mode auto
+  python comic_convert.py ./comics/ ./out/ --format cbz --workers 4
+  python comic_convert.py ./comics/ ./out/ --format cbz --workers 1   # disable parallelism
+  python comic_convert.py ./comics/ ./out/ --format cbz --dry-run
 """,
     )
     p.add_argument("source", type=Path, help="Source file or directory")
@@ -110,9 +157,27 @@ Examples:
                    help="Replace unreadable pages with a solid white/black page")
     p.add_argument("--pdf-dpi", type=int, default=150, metavar="DPI",
                    help="DPI for rasterizing PDF input pages (default: 150)")
-    p.add_argument("--quality", type=int, default=90, metavar="Q",
-                   help="JPEG quality for re-encoded pages, 1-95 (default: 90)")
+    p.add_argument("--pdf-image-format", choices=["jpeg", "png", "webp"], default="jpeg",
+                   metavar="FMT",
+                   help="Image format for rasterized PDF pages: jpeg (default), png, or webp. "
+                        "Only applies when the source is a PDF. "
+                        "Note: webp in PDF output is transcoded to jpeg (PDF containers do not support WebP).")
+    p.add_argument("--pdf-color-mode", choices=["color", "greyscale", "auto"], default="color",
+                   metavar="MODE",
+                   help="Colour handling for rasterized PDF pages: "
+                        "color (default) – always RGB; "
+                        "greyscale – always L-mode; "
+                        "auto – detect per page, store greyscale when no colour is present "
+                        "(requires numpy). Only applies when the source is a PDF.")
+    p.add_argument("--quality", type=int, default=None, metavar="Q",
+                   help="JPEG/WebP quality for re-encoded pages, 1-95 (default: 90). "
+                        "Ignored for PNG (lossless).")
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing destination files")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Log what would be converted without writing any files")
+    p.add_argument("--workers", type=int, default=None, metavar="N",
+                   help="Number of parallel conversion workers for batch directory mode "
+                        "(default: CPU count). Pass 1 to disable parallelism.")
     p.add_argument("--rar", metavar="PATH",
                    help="Path to the 'rar' create tool for CBR output (auto-detected)")
     p.add_argument("--unrar", metavar="PATH",
@@ -120,40 +185,115 @@ Examples:
     return p
 
 
+def _validate_args(args) -> ConvertOptions:
+    """Validate and normalise parsed CLI args; exit on any error. Returns a
+    ConvertOptions with all conversion settings ready to use."""
+    if args.drop_first < 0 or args.drop_last < 0:
+        sys.exit("--drop-first/--drop-last must be >= 0")
+    if args.quality is not None and args.pdf_image_format == "png":
+        print("Warning: --quality has no effect with --pdf-image-format png (PNG is lossless).")
+    quality = max(1, min(95, args.quality or 90))
+    if args.pdf_dpi < 1:
+        sys.exit("--pdf-dpi must be >= 1")
+    if args.workers is not None and args.workers < 1:
+        sys.exit("--workers must be >= 1")
+    if args.rar or args.unrar:
+        cl.set_rar_tools(rar=args.rar, unrar=args.unrar)
+    if not args.source.exists():
+        sys.exit(f"Source not found: {args.source}")
+    return ConvertOptions(
+        quality=quality,
+        pdf_dpi=args.pdf_dpi,
+        pdf_image_format=args.pdf_image_format,
+        pdf_color_mode=args.pdf_color_mode,
+        drop_first=args.drop_first,
+        drop_last=args.drop_last,
+        fill_missing=args.fill_missing,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+    )
+
+
 def main() -> None:
     """CLI entry point: validate args, expand source into jobs, convert each,
     and print a summary. Exits non-zero if any file failed."""
     args = build_parser().parse_args()
+    opts = _validate_args(args)
 
-    if args.drop_first < 0 or args.drop_last < 0:
-        sys.exit("--drop-first/--drop-last must be >= 0")
-    args.quality = max(1, min(95, args.quality))
-    if args.pdf_dpi < 1:
-        sys.exit("--pdf-dpi must be >= 1")
-    if args.rar or args.unrar:
-        cl.set_rar_tools(rar=args.rar, unrar=args.unrar)
-
-    if not args.source.exists():
-        sys.exit(f"Source not found: {args.source}")
+    if opts.dry_run:
+        print("DRY RUN — no files will be written.\n")
 
     out_fmt = infer_format(args.dest, args.format)
     jobs = collect_jobs(args.source, args.dest, out_fmt)
 
-    failures = 0
-    for i, (src, dst) in enumerate(jobs, 1):
-        if len(jobs) > 1:
-            print(f"[{i}/{len(jobs)}]", end=" ")
-        try:
-            convert_file(src, dst, out_fmt, args)
-        except cl.ConversionError as e:
-            failures += 1
-            print(f"  ERROR ({src.name}): {e}")
-        except Exception as e:  # noqa: BLE001 - keep batch alive on unexpected errors
-            failures += 1
-            print(f"  UNEXPECTED ERROR ({src.name}): {e}")
+    # None -> ThreadPoolExecutor uses os.cpu_count(); single-file jobs always run inline.
+    workers = args.workers  # None = default (CPU count), or explicit N >= 1
+    use_parallel = workers != 1 and len(jobs) > 1
 
-    done = len(jobs) - failures
-    print(f"Done. {done}/{len(jobs)} converted" + (f", {failures} failed." if failures else "."))
+    failures = 0
+    total = len(jobs)
+    counts = {r: 0 for r in Result}
+
+    if use_parallel:
+        # Counter advances once per completed job (any outcome) under the print
+        # lock, so it is thread-safe and reaches total even when jobs fail.
+        done_counter = itertools.count(1)
+
+        def _run_job_parallel(src: Path, dst: Path) -> Optional[Result]:
+            """Run one job; return its Result, or None if it failed (error already
+            logged). Output is buffered and flushed atomically under the lock."""
+            lines: list[str] = []
+            err: Optional[str] = None
+            result: Optional[Result] = None
+            try:
+                result = convert_file(src, dst, out_fmt, opts, log=lines.append)
+            except cl.ConversionError as e:
+                err = f"  ERROR ({src.name}): {e}"
+            except Exception as e:  # noqa: BLE001 - keep batch alive
+                err = f"  UNEXPECTED ERROR ({src.name}): {e}"
+            with _print_lock:
+                n = next(done_counter)
+                for line in lines:
+                    print(line)
+                if err:
+                    print(err)
+                elif result == Result.CONVERTED:
+                    print(f"  [{n}/{total}] Done: {dst.name}")
+            return result  # None signals failure to the collector
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_run_job_parallel, src, dst) for src, dst in jobs]
+            for future in as_completed(futures):
+                result = future.result()
+                if result is None:
+                    failures += 1
+                else:
+                    counts[result] += 1
+    else:
+        for i, (src, dst) in enumerate(jobs, 1):
+            if total > 1:
+                print(f"[{i}/{total}]", end=" ")
+            try:
+                counts[convert_file(src, dst, out_fmt, opts)] += 1
+            except cl.ConversionError as e:
+                failures += 1
+                print(f"  ERROR ({src.name}): {e}")
+            except Exception as e:  # noqa: BLE001 - keep batch alive
+                failures += 1
+                print(f"  UNEXPECTED ERROR ({src.name}): {e}")
+
+    if opts.dry_run:
+        would_convert = counts[Result.DRY_CONVERT]
+        would_skip = counts[Result.DRY_SKIP]
+        print(f"Dry run complete. {would_convert}/{len(jobs)} would be converted"
+              + (f", {would_skip} would be skipped." if would_skip else "."))
+    else:
+        parts = [f"{counts[Result.CONVERTED]}/{len(jobs)} converted"]
+        if counts[Result.SKIPPED]:
+            parts.append(f"{counts[Result.SKIPPED]} skipped")
+        if failures:
+            parts.append(f"{failures} failed")
+        print("Done. " + ", ".join(parts) + ".")
     sys.exit(1 if failures else 0)
 
 

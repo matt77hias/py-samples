@@ -172,7 +172,8 @@ def process(path: Path, library_root: Path, args, bar: ProgressBar) -> str:
         # write replaces the original, so overwriting the source is safe.
         # strict_cbz=True refuses on any unreadable page rather than silently
         # dropping it and overwriting the source with a shorter file.
-        cl.convert(path, path, "cbz", quality=args.quality, strict_cbz=True)
+        cl.convert(path, path, "cbz", quality=args.quality, strict_cbz=True,
+                   log=bar.note)
         bar.note(f"Normalized CBZ: {path.name}")
         return "cbz"
 
@@ -189,7 +190,7 @@ def process(path: Path, library_root: Path, args, bar: ProgressBar) -> str:
     if cbz_path.exists() and not args.overwrite:
         raise cl.ConversionError(f"target already exists: {cbz_path.name} (use --overwrite)")
 
-    cl.convert(path, cbz_path, "cbz", quality=args.quality)
+    cl.convert(path, cbz_path, "cbz", quality=args.quality, log=bar.note)
 
     if args.no_calibre:
         path.unlink()  # replace source: drop the CBR

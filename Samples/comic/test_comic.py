@@ -39,11 +39,28 @@ def make_jpeg(w=100, h=120, color=(200, 30, 30)) -> bytes:
     return buf.getvalue()
 
 
+def make_grey_jpeg(w=100, h=120, value=128) -> bytes:
+    if cl.Image is None:
+        raise unittest.SkipTest("Pillow not installed")
+    buf = io.BytesIO()
+    cl.Image.new("L", (w, h), value).save(buf, "JPEG")
+    return buf.getvalue()
+
+
 def make_png(w=100, h=120, color=(30, 30, 200)) -> bytes:
     if cl.Image is None:
         raise unittest.SkipTest("Pillow not installed")
     buf = io.BytesIO()
     cl.Image.new("RGB", (w, h), color).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def make_palette_gif(w=100, h=120) -> bytes:
+    """A GIF, which Pillow reports as mode 'P' (palette) on a header decode."""
+    if cl.Image is None:
+        raise unittest.SkipTest("Pillow not installed")
+    buf = io.BytesIO()
+    cl.Image.new("P", (w, h)).save(buf, "GIF")
     return buf.getvalue()
 
 
@@ -376,6 +393,20 @@ class TestCbzConversion(unittest.TestCase):
             self.assertEqual(z.read("ComicInfo.xml"), b"<meta/>")
         self.assertTrue(cl.is_normalized_cbz(dst))
 
+    def test_write_cbz_images_use_zip_stored(self):
+        """JPEG and PNG pages are stored with ZIP_STORED (not DEFLATED) in the output CBZ."""
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": make_jpeg(), "2.png": make_png()})
+        dst = self.dir / "stored.cbz"
+        cl.convert(src, dst, "cbz")
+        with zipfile.ZipFile(dst) as z:
+            for info in z.infolist():
+                if Path(info.filename).suffix.lower() in (".jpg", ".png"):
+                    self.assertEqual(
+                        info.compress_type, zipfile.ZIP_STORED,
+                        f"{info.filename} should use ZIP_STORED, got {info.compress_type}",
+                    )
+
     def test_extra_never_shadows_a_page(self):
         """An extra whose name collides with a generated page name is dropped,
         not written over the page (guard exists in both write_cbz and write_cbr)."""
@@ -432,6 +463,44 @@ class TestCbzConversion(unittest.TestCase):
             self.assertEqual(im.size, (500, 700))              # matches ref resolution
             self.assertEqual(im.convert("RGB").getpixel((0, 0)), (255, 255, 255))
 
+    def test_fill_missing_filler_matches_greyscale_mode(self):
+        """Filler page for a greyscale archive is L-mode, not RGB."""
+        buf = io.BytesIO()
+        grey = make_grey_jpeg(500, 700, 200)
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("1.jpg", grey)
+            z.writestr("2.jpg", grey)  # will be corrupted
+        raw = bytearray(buf.getvalue())
+        second_soi = raw.find(b"\xff\xd8", raw.find(b"\xff\xd8") + 2)
+        raw[second_soi + 10] ^= 0xFF
+        src = self.dir / "grey_bad.cbz"
+        src.write_bytes(raw)
+        dst = self.dir / "grey_filled.cbz"
+        cl.convert(src, dst, "cbz", fill_missing="white")
+        with zipfile.ZipFile(dst) as z:
+            im = cl.Image.open(io.BytesIO(z.read("2.jpg")))
+        self.assertEqual(im.mode, "L")  # filler matches surrounding greyscale pages
+
+    def test_fill_missing_with_palette_reference_page(self):
+        """A palette-mode (GIF) reference page must not crash blank_page: its
+        exotic 'P' mode is clamped to RGB for the filler."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("1.gif", make_palette_gif(300, 400))  # reference page
+            z.writestr("2.jpg", make_jpeg(300, 400))          # will be corrupted
+        raw = bytearray(buf.getvalue())
+        soi = raw.find(b"\xff\xd8")  # the JPEG's start-of-image
+        raw[soi + 10] ^= 0xFF
+        src = self.dir / "palette_bad.cbz"
+        src.write_bytes(raw)
+        dst = self.dir / "palette_filled.cbz"
+        # Must not raise TypeError from Image.new("P", size, (255,255,255)).
+        cl.convert(src, dst, "cbz", fill_missing="white")
+        with zipfile.ZipFile(dst) as z:
+            self.assertEqual(len(z.namelist()), 2)
+            im = cl.Image.open(io.BytesIO(z.read("2.jpg")))
+            self.assertEqual(im.convert("RGB").getpixel((0, 0)), (255, 255, 255))
+
     def test_missing_page_dropped_without_fill(self):
         """Without --fill-missing, an unreadable page is dropped from the output."""
         buf = io.BytesIO()
@@ -446,6 +515,59 @@ class TestCbzConversion(unittest.TestCase):
         dst = self.dir / "out2.cbz"
         n = cl.convert(src, dst, "cbz")  # no fill -> drop the bad page
         self.assertEqual(n, 1)
+
+
+# ── log callable threading ───────────────────────────────────────────────────
+
+@unittest.skipUnless(HAVE_PIL, "Pillow not installed")
+class TestLogCallable(unittest.TestCase):
+    """convert() forwards all diagnostic output to the supplied log callable."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_write_cbz_logged(self):
+        """'Wrote CBZ' line is sent to log, not to stdout."""
+        src = self.dir / "s.cbz"
+        make_cbz(src, {"1.jpg": make_jpeg()})
+        dst = self.dir / "out.cbz"
+        lines: list[str] = []
+        cl.convert(src, dst, "cbz", log=lines.append)
+        self.assertTrue(any("Wrote CBZ" in l for l in lines))
+
+    def test_missing_page_warning_logged(self):
+        """Unreadable-page warning is sent to log, not stdout."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("1.jpg", make_jpeg())
+            z.writestr("2.jpg", make_jpeg())
+        raw = bytearray(buf.getvalue())
+        second_soi = raw.find(b"\xff\xd8", raw.find(b"\xff\xd8") + 2)
+        raw[second_soi + 5] ^= 0xFF
+        src = self.dir / "bad.cbz"
+        src.write_bytes(raw)
+        lines: list[str] = []
+        cl.convert(src, self.dir / "out.cbz", "cbz", log=lines.append)
+        self.assertTrue(any("Warning" in l for l in lines))
+
+    def test_fill_missing_replacement_logged(self):
+        """Filler-page replacement message is sent to log."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("1.jpg", make_jpeg(200, 300))
+            z.writestr("2.jpg", make_jpeg(200, 300))
+        raw = bytearray(buf.getvalue())
+        second_soi = raw.find(b"\xff\xd8", raw.find(b"\xff\xd8") + 2)
+        raw[second_soi + 10] ^= 0xFF
+        src = self.dir / "bad2.cbz"
+        src.write_bytes(raw)
+        lines: list[str] = []
+        cl.convert(src, self.dir / "out2.cbz", "cbz", fill_missing="white", log=lines.append)
+        self.assertTrue(any("Replacing missing" in l for l in lines))
 
 
 # ── PDF round-trips (need Pillow + fitz/img2pdf) ─────────────────────────────
@@ -611,6 +733,112 @@ class TestCollectJobs(unittest.TestCase):
         self.assertEqual(jobs, [(src, self.dir / "y.pdf")])
 
 
+# ── --dry-run ────────────────────────────────────────────────────────────────
+
+@unittest.skipUnless(HAVE_PIL, "Pillow not installed")
+class TestDryRun(unittest.TestCase):
+    """--dry-run: logs intent without writing any output files."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _make_args(self, dry_run=True, overwrite=False):
+        return cc.ConvertOptions(dry_run=dry_run, overwrite=overwrite)
+
+    def test_dry_run_writes_no_file(self):
+        """In dry-run mode, no destination file is created."""
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": make_jpeg()})
+        dst = self.dir / "out.cbz"
+        cc.convert_file(src, dst, "cbz", self._make_args())
+        self.assertFalse(dst.exists())
+
+    def test_dry_run_logs_would_convert(self):
+        """'Would convert' is logged when destination does not exist."""
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": make_jpeg()})
+        dst = self.dir / "out.cbz"
+        lines: list[str] = []
+        cc.convert_file(src, dst, "cbz", self._make_args(), log=lines.append)
+        self.assertTrue(any("Would convert" in l for l in lines))
+
+    def test_dry_run_logs_would_skip_when_dest_exists(self):
+        """'Would skip' is logged when destination exists and --overwrite is not set."""
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": make_jpeg()})
+        dst = self.dir / "out.cbz"
+        dst.touch()  # destination already exists
+        lines: list[str] = []
+        cc.convert_file(src, dst, "cbz", self._make_args(), log=lines.append)
+        self.assertTrue(any("Would skip" in l for l in lines))
+
+    def test_dry_run_overwrite_flag_overrides_skip(self):
+        """With --overwrite set, 'Would convert' is logged even when dest exists."""
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": make_jpeg()})
+        dst = self.dir / "out.cbz"
+        dst.touch()
+        lines: list[str] = []
+        cc.convert_file(src, dst, "cbz", self._make_args(overwrite=True), log=lines.append)
+        self.assertTrue(any("Would convert" in l for l in lines))
+        self.assertFalse(any("Would skip" in l for l in lines))
+        self.assertEqual(dst.stat().st_size, 0)  # file untouched (still empty)
+
+    def test_returns_dry_convert_result(self):
+        """Dry-run of a new dest returns Result.DRY_CONVERT."""
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": make_jpeg()})
+        r = cc.convert_file(src, self.dir / "out.cbz", "cbz", self._make_args())
+        self.assertIs(r, cc.Result.DRY_CONVERT)
+
+    def test_returns_dry_skip_result(self):
+        """Dry-run when dest exists (no overwrite) returns Result.DRY_SKIP."""
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": make_jpeg()})
+        dst = self.dir / "out.cbz"
+        dst.touch()
+        r = cc.convert_file(src, dst, "cbz", self._make_args())
+        self.assertIs(r, cc.Result.DRY_SKIP)
+
+
+# ── convert_file result codes (non-dry-run) ──────────────────────────────────
+
+@unittest.skipUnless(HAVE_PIL, "Pillow not installed")
+class TestConvertFileResult(unittest.TestCase):
+    """convert_file returns an accurate Result so main() can tally outcomes."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_converted_result(self):
+        """A real conversion returns Result.CONVERTED."""
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": make_jpeg()})
+        r = cc.convert_file(src, self.dir / "out.cbz", "cbz", cc.ConvertOptions())
+        self.assertIs(r, cc.Result.CONVERTED)
+
+    def test_skipped_result_when_dest_exists(self):
+        """An existing dest without --overwrite returns Result.SKIPPED and does
+        not rewrite the file."""
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": make_jpeg()})
+        dst = self.dir / "out.cbz"
+        dst.write_bytes(b"sentinel")
+        r = cc.convert_file(src, dst, "cbz", cc.ConvertOptions())
+        self.assertIs(r, cc.Result.SKIPPED)
+        self.assertEqual(dst.read_bytes(), b"sentinel")  # untouched
+
+
+# ── infer_format ──────────────────────────────────────────────────────────────
+
 class TestInferFormat(unittest.TestCase):
     """infer_format(): explicit flag wins, else read from the dest extension."""
 
@@ -623,6 +851,265 @@ class TestInferFormat(unittest.TestCase):
     def test_unknown_exits(self):
         with self.assertRaises(SystemExit):
             cc.infer_format(Path("out.txt"), None)
+
+
+# ── Page.encoded() image_format support ─────────────────────────────────────
+
+@unittest.skipUnless(HAVE_PIL, "Pillow not installed")
+class TestPageEncoded(unittest.TestCase):
+    """Page.encoded(): respects image_format (jpeg/png/webp)."""
+
+    def _rgb_page(self, color=(200, 100, 50)):
+        return cl.Page(image=cl.Image.new("RGB", (64, 64), color))
+
+    def test_jpeg_output(self):
+        data, ext = self._rgb_page().encoded(90, image_format="jpeg")
+        self.assertEqual(ext, ".jpg")
+        img = cl.Image.open(io.BytesIO(data))
+        self.assertEqual(img.format, "JPEG")
+
+    def test_png_output(self):
+        data, ext = self._rgb_page().encoded(90, image_format="png")
+        self.assertEqual(ext, ".png")
+        img = cl.Image.open(io.BytesIO(data))
+        self.assertEqual(img.format, "PNG")
+
+    def test_webp_output(self):
+        try:
+            data, ext = self._rgb_page().encoded(85, image_format="webp")
+        except Exception:
+            self.skipTest("WebP not supported by this Pillow build")
+        self.assertEqual(ext, ".webp")
+        img = cl.Image.open(io.BytesIO(data))
+        self.assertEqual(img.format, "WEBP")
+
+    def test_passthrough_bypasses_format(self):
+        """Passthrough exts are returned unchanged regardless of image_format."""
+        raw_jpeg = make_jpeg()
+        p = cl.Page(data=raw_jpeg, ext=".jpg")
+        data, ext = p.encoded(90, frozenset({".jpg"}), image_format="png")
+        self.assertEqual(data, raw_jpeg)   # untouched bytes
+        self.assertEqual(ext, ".jpg")      # original ext preserved
+
+    def test_png_is_lossless(self):
+        """PNG output for a page created from bytes should round-trip pixel-exactly."""
+        original_color = (123, 45, 67)
+        page = cl.Page(image=cl.Image.new("RGB", (10, 10), original_color))
+        data, _ = page.encoded(90, image_format="png")
+        img = cl.Image.open(io.BytesIO(data))
+        self.assertEqual(img.getpixel((0, 0)), original_color)
+
+    def test_l_mode_jpeg_stays_grey(self):
+        """An L-mode page encoded to JPEG produces a greyscale JPEG (not RGB)."""
+        page = cl.Page(image=cl.Image.new("L", (32, 32), 128))
+        data, ext = page.encoded(90, image_format="jpeg")
+        self.assertEqual(ext, ".jpg")
+        img = cl.Image.open(io.BytesIO(data))
+        self.assertEqual(img.mode, "L")
+
+    def test_l_mode_png_stays_grey(self):
+        """An L-mode page encoded to PNG keeps L mode (lossless greyscale)."""
+        page = cl.Page(image=cl.Image.new("L", (32, 32), 64))
+        data, ext = page.encoded(90, image_format="png")
+        self.assertEqual(ext, ".png")
+        img = cl.Image.open(io.BytesIO(data))
+        self.assertEqual(img.mode, "L")
+
+    def test_l_mode_webp_stays_grey(self):
+        """An L-mode page encoded to WebP stays greyscale (WebP supports L natively)."""
+        try:
+            page = cl.Page(image=cl.Image.new("L", (32, 32), 200))
+            data, ext = page.encoded(85, image_format="webp")
+        except Exception:
+            self.skipTest("WebP not supported by this Pillow build")
+        self.assertEqual(ext, ".webp")
+        img = cl.Image.open(io.BytesIO(data))
+        self.assertEqual(img.mode, "L")
+
+
+# ── Page.is_greyscale() ─────────────────────────────────────────────────────
+
+@unittest.skipUnless(HAVE_PIL, "Pillow not installed")
+class TestPageIsGreyscale(unittest.TestCase):
+    """Page.is_greyscale(): detects L-mode and equal-channel RGB images."""
+
+    def test_l_mode_image_is_grey(self):
+        p = cl.Page(image=cl.Image.new("L", (50, 50), 128))
+        self.assertTrue(p.is_greyscale())
+
+    def test_rgb_grey_image(self):
+        """An RGB image where R==G==B counts as greyscale."""
+        p = cl.Page(image=cl.Image.new("RGB", (50, 50), (80, 80, 80)))
+        self.assertTrue(p.is_greyscale())
+
+    def test_colour_image_is_not_grey(self):
+        p = cl.Page(image=cl.Image.new("RGB", (50, 50), (255, 0, 0)))
+        self.assertFalse(p.is_greyscale())
+
+    def test_jpeg_bytes_colour(self):
+        """A coloured JPEG decoded from bytes is not greyscale."""
+        raw = make_jpeg(color=(200, 50, 10))
+        p = cl.Page(data=raw, ext=".jpg")
+        self.assertFalse(p.is_greyscale())
+
+
+# ── PDF image_format and grayscale_detect (need fitz + Pillow) ───────────────
+
+@unittest.skipUnless(HAVE_PIL and cl.fitz is not None,
+                     "PyMuPDF or Pillow not installed")
+class TestPdfImageFormat(unittest.TestCase):
+    """PDF -> CBZ with --pdf-image-format jpeg/png/webp produces correctly-typed pages."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        # Build a minimal 1-page colour PDF via CBZ->PDF conversion.
+        src_cbz = self.dir / "src.cbz"
+        make_cbz(src_cbz, {"1.jpg": make_jpeg(color=(200, 50, 50))})
+        self.pdf = self.dir / "src.pdf"
+        cl.convert(src_cbz, self.pdf, "pdf")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _convert_and_read_page(self, image_format: str):
+        dst = self.dir / f"out_{image_format}.cbz"
+        cl.convert(self.pdf, dst, "cbz", pdf_dpi=72, pdf_image_format=image_format)
+        with zipfile.ZipFile(dst) as z:
+            name = z.namelist()[0]
+            return cl.Image.open(io.BytesIO(z.read(name)))
+
+    def test_jpeg_format(self):
+        img = self._convert_and_read_page("jpeg")
+        self.assertEqual(img.format, "JPEG")
+
+    def test_png_format(self):
+        img = self._convert_and_read_page("png")
+        self.assertEqual(img.format, "PNG")
+
+    def test_webp_format(self):
+        try:
+            img = self._convert_and_read_page("webp")
+        except Exception:
+            self.skipTest("WebP not supported")
+        self.assertEqual(img.format, "WEBP")
+
+    def test_pdf_color_mode_greyscale(self):
+        """pdf_color_mode='greyscale' forces all pages to L-mode."""
+        dst = self.dir / "grey_out.cbz"
+        cl.convert(self.pdf, dst, "cbz", pdf_dpi=72, pdf_color_mode="greyscale",
+                   pdf_image_format="png")
+        with zipfile.ZipFile(dst) as z:
+            name = z.namelist()[0]
+            img = cl.Image.open(io.BytesIO(z.read(name)))
+        self.assertEqual(img.mode, "L")
+
+    def test_pdf_color_mode_auto_grey_page(self):
+        """pdf_color_mode='auto' stores a genuinely grey page as L-mode."""
+        grey_cbz = self.dir / "grey.cbz"
+        make_cbz(grey_cbz, {"1.jpg": make_jpeg(color=(128, 128, 128))})
+        grey_pdf = self.dir / "grey.pdf"
+        cl.convert(grey_cbz, grey_pdf, "pdf")
+
+        dst = self.dir / "auto_grey_out.cbz"
+        cl.convert(grey_pdf, dst, "cbz", pdf_dpi=72, pdf_color_mode="auto",
+                   pdf_image_format="png")
+        with zipfile.ZipFile(dst) as z:
+            name = z.namelist()[0]
+            img = cl.Image.open(io.BytesIO(z.read(name)))
+        self.assertIn(img.mode, ("L", "RGB"))  # L when auto detects grey
+
+    def test_pdf_image_format_only_applies_to_pdf_source(self):
+        """Converting CBZ->CBZ ignores pdf_image_format; passthrough is used."""
+        src = self.dir / "passthrough_src.cbz"
+        raw_jpeg = make_jpeg()
+        make_cbz(src, {"1.jpg": raw_jpeg})
+        dst = self.dir / "passthrough_dst.cbz"
+        cl.convert(src, dst, "cbz", pdf_image_format="png")  # should NOT re-encode as PNG
+        with zipfile.ZipFile(dst) as z:
+            self.assertEqual(z.namelist(), ["1.jpg"])  # still .jpg
+
+    def test_pdf_color_mode_greyscale_output_is_l_mode(self):
+        """pdf_color_mode='greyscale' + png produces L-mode PNG pages (not RGB)."""
+        dst = self.dir / "grey_png.cbz"
+        cl.convert(self.pdf, dst, "cbz", pdf_dpi=72,
+                   pdf_color_mode="greyscale", pdf_image_format="png")
+        with zipfile.ZipFile(dst) as z:
+            img = cl.Image.open(io.BytesIO(z.read(z.namelist()[0])))
+        self.assertEqual(img.mode, "L")
+
+    def test_invalid_pdf_color_mode_raises(self):
+        """An unknown pdf_color_mode raises ConversionError rather than silently
+        falling back to colour."""
+        with self.assertRaises(cl.ConversionError):
+            cl.extract_from_pdf(self.pdf, 72, pdf_color_mode="bogus")
+
+
+# ── comic_convert CLI parallel workers ──────────────────────────────────────
+
+@unittest.skipUnless(HAVE_PIL, "Pillow not installed")
+class TestParallelWorkers(unittest.TestCase):
+    """--workers N runs multiple conversions concurrently and reports correctly."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _make_src_dir(self, n: int) -> Path:
+        src = self.dir / "src"
+        src.mkdir(exist_ok=True)
+        for i in range(n):
+            make_cbz(src / f"book{i}.cbz", {f"1.jpg": make_jpeg(color=(i * 10, 50, 50))})
+        return src
+
+    def _make_args(self):
+        return cc.ConvertOptions()
+
+    def test_parallel_converts_all_files(self):
+        """Parallel workers (ThreadPoolExecutor) convert all files without failures."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        src = self._make_src_dir(6)
+        dst = self.dir / "out"
+        jobs = cc.collect_jobs(src, dst, "cbz")
+        args = self._make_args()
+        failures = 0
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(cc.convert_file, s, d, "cbz", args) for s, d in jobs}
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    failures += 1
+        self.assertEqual(failures, 0)
+        self.assertEqual(len(sorted(dst.glob("*.cbz"))), 6)
+
+    def test_serial_converts_all_files(self):
+        """Serial execution produces the same output as parallel."""
+        src = self._make_src_dir(4)
+        dst = self.dir / "serial_out"
+        jobs = cc.collect_jobs(src, dst, "cbz")
+        args = self._make_args()
+        for s, d in jobs:
+            cc.convert_file(s, d, "cbz", args)
+        self.assertEqual(len(sorted(dst.glob("*.cbz"))), 4)
+
+    def test_workers_default_is_none(self):
+        """Default --workers is None (resolved to CPU count at runtime)."""
+        args = cc.build_parser().parse_args(["src", "dst"])
+        self.assertIsNone(args.workers)
+
+    def test_workers_arg_parsed(self):
+        """--workers N overrides the default."""
+        args = cc.build_parser().parse_args(["src", "dst", "--workers", "3"])
+        self.assertEqual(args.workers, 3)
+
+    def test_workers_one_disables_parallelism(self):
+        """--workers 1 is accepted and means serial execution."""
+        args = cc.build_parser().parse_args(["src", "dst", "--workers", "1"])
+        self.assertEqual(args.workers, 1)
 
 
 if __name__ == "__main__":
