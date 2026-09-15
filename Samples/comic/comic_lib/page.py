@@ -58,6 +58,27 @@ class Page:
             pass
         return False
 
+    def image_info(self) -> "Optional[tuple[tuple[int, int], str]]":
+        """Return (size, mode) without fully decoding the image, or None.
+
+        Uses the already-decoded bitmap when available; otherwise does a
+        header-only open of the raw bytes (cheap — no pixel data decoded)."""
+        if self._image is not None:
+            return self._image.size, self._image.mode
+        if self.data is not None:
+            require(Image, "Pillow", "pip install Pillow")
+            try:
+                img = Image.open(io.BytesIO(self.data))
+                return img.size, img.mode
+            except Exception:
+                return None
+        return None
+
+    def release(self) -> None:
+        """Drop the decoded bitmap and raw bytes to free memory after encoding."""
+        self._image = None
+        self.data = None
+
     def encoded(
         self,
         quality: int,
@@ -80,7 +101,9 @@ class Page:
                 img = img.convert("RGB")
             img.save(buf, format="PNG", optimize=True)
         else:  # WEBP
-            if img.mode not in ("L", "RGB", "RGBA"):
+            # Pillow's WebP encoder silently promotes L to RGB on save; convert
+            # explicitly so the round-trip mode is predictable (always RGB/RGBA).
+            if img.mode not in ("RGB", "RGBA"):
                 img = img.convert("RGB")
             img.save(buf, format="WEBP", quality=quality, method=4)
         return buf.getvalue(), ext

@@ -1,7 +1,9 @@
 """Archive and PDF writers."""
 
+import io
 import os
 import subprocess
+import tarfile
 import tempfile
 import zipfile
 from contextlib import contextmanager
@@ -10,11 +12,14 @@ from typing import Optional
 
 from ._core import (
     ConversionError, require,
-    fitz, img2pdf,
+    fitz, img2pdf, py7zr,
     ARCHIVE_PASSTHROUGH_EXTS, _ZIP_STORED_EXTS,
 )
 from ._rar import RAR_TOOL
 from .page import Page, page_name
+
+_ARCHIVE_PASSTHROUGH = frozenset(ARCHIVE_PASSTHROUGH_EXTS)
+_ZIP_STORED = frozenset(_ZIP_STORED_EXTS)
 
 _FITZ_FILETYPE = {".jpg": "jpg", ".jpeg": "jpg", ".png": "png"}
 
@@ -50,10 +55,10 @@ def write_cbz(
     with atomic_output(dest) as tmp:
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for i, p in enumerate(pages):
-                data, ext = p.encoded(quality, frozenset(ARCHIVE_PASSTHROUGH_EXTS), image_format)
+                data, ext = p.encoded(quality, _ARCHIVE_PASSTHROUGH, image_format)
                 name = page_name(i, total, ext)
                 used_names.add(name.lower())
-                compression = (zipfile.ZIP_STORED if ext in _ZIP_STORED_EXTS
+                compression = (zipfile.ZIP_STORED if ext in _ZIP_STORED
                                else zipfile.ZIP_DEFLATED)
                 zf.writestr(name, data, compress_type=compression)
             for name, data in (extras or {}).items():
@@ -86,7 +91,7 @@ def write_cbr(
         tmp_path = Path(tmp)
         used_names = set()
         for i, p in enumerate(pages):
-            data, ext = p.encoded(quality, frozenset(ARCHIVE_PASSTHROUGH_EXTS), image_format)
+            data, ext = p.encoded(quality, _ARCHIVE_PASSTHROUGH, image_format)
             name = page_name(i, total, ext)
             used_names.add(name.lower())
             (tmp_path / name).write_bytes(data)
@@ -128,6 +133,63 @@ def write_cbr(
             archive.unlink(missing_ok=True)
             raise
     log(f"  Wrote CBR: {dest}")
+
+
+def write_cbt(
+    pages: list[Page],
+    dest: Path,
+    quality: int,
+    extras: Optional[dict[str, bytes]] = None,
+    image_format: str = "jpeg",
+    log=print,
+) -> None:
+    """Write pages to a CBT (TAR) at dest with padded page names, atomically."""
+    total = len(pages)
+    used_names: set[str] = set()
+    with atomic_output(dest) as tmp:
+        with tarfile.open(tmp, "w") as tf:
+            for i, p in enumerate(pages):
+                data, ext = p.encoded(quality, _ARCHIVE_PASSTHROUGH, image_format)
+                name = page_name(i, total, ext)
+                used_names.add(name.lower())
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            for name, data in (extras or {}).items():
+                base = Path(name).name
+                if base.lower() in used_names:
+                    continue
+                info = tarfile.TarInfo(name=base)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+    log(f"  Wrote CBT: {dest}")
+
+
+def write_cb7(
+    pages: list[Page],
+    dest: Path,
+    quality: int,
+    extras: Optional[dict[str, bytes]] = None,
+    image_format: str = "jpeg",
+    log=print,
+) -> None:
+    """Write pages to a CB7 (7-Zip) at dest with padded page names, atomically."""
+    require(py7zr, "py7zr", "pip install py7zr")
+    total = len(pages)
+    used_names: set[str] = set()
+    with atomic_output(dest) as tmp:
+        with py7zr.SevenZipFile(tmp, mode="w") as zf:
+            for i, p in enumerate(pages):
+                data, ext = p.encoded(quality, _ARCHIVE_PASSTHROUGH, image_format)
+                name = page_name(i, total, ext)
+                used_names.add(name.lower())
+                zf.writef(io.BytesIO(data), name)
+            for name, data in (extras or {}).items():
+                base = Path(name).name
+                if base.lower() in used_names:
+                    continue
+                zf.writef(io.BytesIO(data), base)
+    log(f"  Wrote CB7: {dest}")
 
 
 def write_pdf(
@@ -178,6 +240,10 @@ def write_output(
         write_cbz(pages, dest, quality, extras, image_format, log)
     elif fmt == "cbr":
         write_cbr(pages, dest, quality, extras, image_format, log)
+    elif fmt == "cbt":
+        write_cbt(pages, dest, quality, extras, image_format, log)
+    elif fmt == "cb7":
+        write_cb7(pages, dest, quality, extras, image_format, log)
     elif fmt == "pdf":
         write_pdf(pages, dest, quality, image_format, log)
     else:

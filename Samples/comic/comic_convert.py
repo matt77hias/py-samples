@@ -33,8 +33,9 @@ class ConvertOptions:
     """Typed conversion options forwarded from the CLI to convert_file and cl.convert."""
     quality: int = 90
     pdf_dpi: int = 150
-    pdf_image_format: str = "jpeg"
+    image_format: Optional[str] = None
     pdf_color_mode: str = "color"
+    no_upscale: bool = False
     drop_first: int = 0
     drop_last: int = 0
     fill_missing: Optional[str] = None
@@ -46,7 +47,7 @@ def infer_format(dest: Path, explicit: Optional[str]) -> str:
     if explicit:
         return explicit
     ext = dest.suffix.lower().lstrip(".")
-    if ext in ("cbr", "cbz", "pdf"):
+    if ext in ("cbr", "cbz", "pdf", "cbt", "cb7"):
         return ext
     sys.exit(
         f"Cannot infer output format from '{dest}'. "
@@ -116,8 +117,9 @@ def convert_file(src: Path, dst: Path, out_fmt: str, opts: ConvertOptions, log=p
         src, dst, out_fmt,
         quality=opts.quality,
         pdf_dpi=opts.pdf_dpi,
-        pdf_image_format=opts.pdf_image_format,
+        image_format=opts.image_format,
         pdf_color_mode=opts.pdf_color_mode,
+        no_upscale=opts.no_upscale,
         drop_first=opts.drop_first,
         drop_last=opts.drop_last,
         fill_missing=opts.fill_missing,
@@ -138,8 +140,12 @@ Examples:
   python comic_convert.py ./comics/ ./out/ --format cbz
   python comic_convert.py book.cbz book.pdf --drop-first 1 --drop-last 1 --fill-missing white
   python comic_convert.py book.pdf book.cbz --quality 95 --pdf-dpi 200
-  python comic_convert.py book.pdf book.cbz --pdf-image-format png
-  python comic_convert.py book.pdf book.cbz --pdf-image-format webp --quality 85
+  python comic_convert.py book.pdf book.cbz --image-format webp --pdf-dpi 300 --no-upscale
+  python comic_convert.py book.cbt book.cbz
+  python comic_convert.py book.cb7 book.cbz
+  python comic_convert.py book.pdf book.cbz --image-format png
+  python comic_convert.py book.cbz book.cbz --image-format webp --quality 85
+  python comic_convert.py ./comics/ ./out/ --format cbz --image-format webp
   python comic_convert.py book.pdf book.cbz --pdf-color-mode greyscale
   python comic_convert.py book.pdf book.cbz --pdf-color-mode auto
   python comic_convert.py ./comics/ ./out/ --format cbz --workers 4
@@ -149,7 +155,7 @@ Examples:
     )
     p.add_argument("source", type=Path, help="Source file or directory")
     p.add_argument("dest", type=Path, help="Destination file or directory")
-    p.add_argument("-f", "--format", choices=["cbr", "cbz", "pdf"],
+    p.add_argument("-f", "--format", choices=["cbr", "cbz", "pdf", "cbt", "cb7"],
                    help="Output format (inferred from dest extension if omitted)")
     p.add_argument("--drop-first", type=int, default=0, metavar="N", help="Drop the first N pages")
     p.add_argument("--drop-last", type=int, default=0, metavar="N", help="Drop the last N pages")
@@ -157,10 +163,12 @@ Examples:
                    help="Replace unreadable pages with a solid white/black page")
     p.add_argument("--pdf-dpi", type=int, default=150, metavar="DPI",
                    help="DPI for rasterizing PDF input pages (default: 150)")
-    p.add_argument("--pdf-image-format", choices=["jpeg", "png", "webp"], default="jpeg",
+    p.add_argument("--image-format", choices=["jpeg", "png", "webp"], default=None,
                    metavar="FMT",
-                   help="Image format for rasterized PDF pages: jpeg (default), png, or webp. "
-                        "Only applies when the source is a PDF. "
+                   help="Force every output page to this codec (jpeg, png, or webp), for ANY "
+                        "source. Enables re-encoding archives, e.g. CBZ(PNG) -> CBZ(WebP). "
+                        "When omitted, archive pages keep their original bytes (lossless "
+                        "passthrough) and PDF pages default to JPEG. "
                         "Note: webp in PDF output is transcoded to jpeg (PDF containers do not support WebP).")
     p.add_argument("--pdf-color-mode", choices=["color", "greyscale", "auto"], default="color",
                    metavar="MODE",
@@ -169,6 +177,11 @@ Examples:
                         "greyscale – always L-mode; "
                         "auto – detect per page, store greyscale when no colour is present "
                         "(requires numpy). Only applies when the source is a PDF.")
+    p.add_argument("--no-upscale", action="store_true",
+                   help="When rasterizing a PDF, never render a page above the native "
+                        "resolution of its embedded image. --pdf-dpi stays the ceiling, but "
+                        "pages whose source is lower-res are rendered at native instead of "
+                        "interpolated up, avoiding bloat with no loss of real detail.")
     p.add_argument("--quality", type=int, default=None, metavar="Q",
                    help="JPEG/WebP quality for re-encoded pages, 1-95 (default: 90). "
                         "Ignored for PNG (lossless).")
@@ -190,8 +203,8 @@ def _validate_args(args) -> ConvertOptions:
     ConvertOptions with all conversion settings ready to use."""
     if args.drop_first < 0 or args.drop_last < 0:
         sys.exit("--drop-first/--drop-last must be >= 0")
-    if args.quality is not None and args.pdf_image_format == "png":
-        print("Warning: --quality has no effect with --pdf-image-format png (PNG is lossless).")
+    if args.quality is not None and args.image_format == "png":
+        print("Warning: --quality has no effect when encoding to png (PNG is lossless).")
     quality = max(1, min(95, args.quality or 90))
     if args.pdf_dpi < 1:
         sys.exit("--pdf-dpi must be >= 1")
@@ -204,8 +217,9 @@ def _validate_args(args) -> ConvertOptions:
     return ConvertOptions(
         quality=quality,
         pdf_dpi=args.pdf_dpi,
-        pdf_image_format=args.pdf_image_format,
+        image_format=args.image_format,
         pdf_color_mode=args.pdf_color_mode,
+        no_upscale=args.no_upscale,
         drop_first=args.drop_first,
         drop_last=args.drop_last,
         fill_missing=args.fill_missing,

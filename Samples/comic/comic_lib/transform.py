@@ -1,9 +1,8 @@
 """Page-level transforms: drop, fill-missing."""
 
-import io
 from typing import Optional
 
-from ._core import ConversionError, require, Image
+from ._core import ConversionError
 from .page import Page, blank_page
 
 
@@ -35,27 +34,18 @@ def apply_transforms(
         nonlocal ref_size, ref_mode, ref_resolved
         if not ref_resolved:
             ref_resolved = True
-            require(Image, "Pillow", "pip install Pillow")
             for q in pages:
                 if not q.missing:
-                    try:
-                        if q._image is not None:
-                            ref_size = q._image.size
-                            ref_mode = q._image.mode
-                        elif q.data is not None:
-                            img = Image.open(io.BytesIO(q.data))  # header only
-                            ref_size = img.size
-                            ref_mode = img.mode
-                        else:
-                            continue
-                        # A header-only decode can report palette/CMYK/etc modes
-                        # (e.g. "P" for GIFs); blank_page only supports L/RGB, so
-                        # clamp anything exotic to RGB — matching Page.pil().
-                        if ref_mode not in ("RGB", "L"):
-                            ref_mode = "RGB"
-                        break
-                    except Exception:
-                        pass
+                    info = q.image_info()
+                    if info is None:
+                        continue
+                    ref_size, ref_mode = info
+                    # A header-only decode can report palette/CMYK/etc modes
+                    # (e.g. "P" for GIFs); blank_page only supports L/RGB, so
+                    # clamp anything exotic to RGB — matching Page.pil().
+                    if ref_mode not in ("RGB", "L"):
+                        ref_mode = "RGB"
+                    break
         return ref_size or (1275, 1755), ref_mode
 
     for i, p in enumerate(pages):

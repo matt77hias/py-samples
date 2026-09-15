@@ -19,7 +19,8 @@ from tempfile import TemporaryDirectory
 
 import comic_lib as cl
 import comic_convert as cc
-from calibre_normalize import book_id_from_path, resolve_cbr_cbz_pairs
+from calibre_lib import book_id_from_path
+from calibre_normalize import resolve_archive_pairs
 
 # ── Optional-dependency probes ───────────────────────────────────────────────
 
@@ -130,13 +131,13 @@ class TestPageEntryFilter(unittest.TestCase):
     def test_accepts_real_pages(self):
         """Image files (incl. nested, mixed-case ext) count as pages."""
         for n in ["01.jpg", "page10.PNG", "ch1/02.jpg", "cover.jpeg"]:
-            self.assertTrue(cl._is_page_entry(n), n)
+            self.assertTrue(cl.is_page_entry(n), n)
 
     def test_rejects_junk(self):
         """macOS forks, dotfiles, Thumbs.db, dirs and non-images are skipped."""
         for n in ["__MACOSX/._01.jpg", "._01.jpg", ".DS_Store",
                   "Thumbs.db", "subdir/", "notes.txt"]:
-            self.assertFalse(cl._is_page_entry(n), n)
+            self.assertFalse(cl.is_page_entry(n), n)
 
 
 # ── Pure logic: is_normalized_cbz ────────────────────────────────────────────
@@ -327,39 +328,49 @@ class TestBookId(unittest.TestCase):
 
 # ── Calibre: CBR/CBZ same-stem resolution ────────────────────────────────────
 
-class TestResolveCbrCbzPairs(unittest.TestCase):
-    """resolve_cbr_cbz_pairs(): when a CBR and CBZ share a stem, the CBR is
-    ignored (CBZ already satisfies the target) - never converted over its sibling."""
+class TestResolveArchivePairs(unittest.TestCase):
+    """resolve_archive_pairs(): when any non-CBZ archive shares a stem with a
+    CBZ in the same directory, it is ignored (CBZ already satisfies the target)."""
 
     def test_cbr_ignored_when_cbz_sibling_exists(self):
-        """The CBR is dropped from the worklist; the CBZ is kept."""
         d = Path("/lib/A/T (1)")
         cbr, cbz = d / "foo.cbr", d / "foo.cbz"
-        keep, ignored = resolve_cbr_cbz_pairs([cbr, cbz])
+        keep, ignored = resolve_archive_pairs([cbr, cbz])
         self.assertEqual(keep, [cbz])
         self.assertEqual(ignored, [cbr])
 
+    def test_cbt_ignored_when_cbz_sibling_exists(self):
+        d = Path("/lib/A/T (1)")
+        cbt, cbz = d / "foo.cbt", d / "foo.cbz"
+        keep, ignored = resolve_archive_pairs([cbt, cbz])
+        self.assertEqual(keep, [cbz])
+        self.assertEqual(ignored, [cbt])
+
+    def test_cb7_ignored_when_cbz_sibling_exists(self):
+        d = Path("/lib/A/T (1)")
+        cb7, cbz = d / "foo.cb7", d / "foo.cbz"
+        keep, ignored = resolve_archive_pairs([cb7, cbz])
+        self.assertEqual(keep, [cbz])
+        self.assertEqual(ignored, [cb7])
+
     def test_standalone_files_untouched(self):
-        """A lone CBR and a lone CBZ (different stems) are both kept."""
         lone_cbr = Path("/lib/A/a.cbr")
         lone_cbz = Path("/lib/B/b.cbz")
-        keep, ignored = resolve_cbr_cbz_pairs([lone_cbr, lone_cbz])
+        keep, ignored = resolve_archive_pairs([lone_cbr, lone_cbz])
         self.assertEqual(sorted(keep), sorted([lone_cbr, lone_cbz]))
         self.assertEqual(ignored, [])
 
     def test_same_stem_different_dirs_not_a_pair(self):
-        """Same stem in different folders is not a conflict (different books)."""
         cbr = Path("/lib/A (1)/foo.cbr")
         cbz = Path("/lib/B (2)/foo.cbz")
-        keep, ignored = resolve_cbr_cbz_pairs([cbr, cbz])
+        keep, ignored = resolve_archive_pairs([cbr, cbz])
         self.assertEqual(ignored, [])
         self.assertEqual(sorted(keep), sorted([cbr, cbz]))
 
     def test_case_insensitive_stem_match(self):
-        """Stem matching is case-insensitive (Foo.cbr vs foo.cbz)."""
         d = Path("/lib/A (1)")
         cbr, cbz = d / "Foo.cbr", d / "foo.cbz"
-        keep, ignored = resolve_cbr_cbz_pairs([cbr, cbz])
+        keep, ignored = resolve_archive_pairs([cbr, cbz])
         self.assertEqual(ignored, [cbr])
         self.assertEqual(keep, [cbz])
 
@@ -517,6 +528,83 @@ class TestCbzConversion(unittest.TestCase):
         self.assertEqual(n, 1)
 
 
+# ── image-format conversion for archives (PNG -> WEBP etc.) ──────────────────
+
+@unittest.skipUnless(HAVE_PIL, "Pillow not installed")
+class TestImageFormatConversion(unittest.TestCase):
+    """--image-format forces re-encoding of archive pages to a chosen codec, and
+    warns when a lossy source is transcoded to a different codec."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_png_archive_reencoded_to_webp(self):
+        """A PNG CBZ converts to a WebP CBZ when image_format='webp'."""
+        try:
+            cl.Image.new("RGB", (8, 8)).save(io.BytesIO(), "WEBP")
+        except Exception:
+            self.skipTest("WebP not supported by this Pillow build")
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.png": make_png(), "2.png": make_png(color=(0, 200, 0))})
+        dst = self.dir / "out.cbz"
+        n = cl.convert(src, dst, "cbz", image_format="webp")
+        self.assertEqual(n, 2)
+        with zipfile.ZipFile(dst) as z:
+            self.assertEqual(z.namelist(), ["1.webp", "2.webp"])
+            self.assertEqual(cl.Image.open(io.BytesIO(z.read("1.webp"))).format, "WEBP")
+
+    def test_lossy_source_to_different_format_warns(self):
+        """Transcoding lossy JPEG pages to a different codec logs a warning."""
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": make_jpeg(), "2.jpg": make_jpeg(color=(0, 200, 0))})
+        lines: list[str] = []
+        cl.convert(src, self.dir / "out.cbz", "cbz", image_format="png", log=lines.append)
+        self.assertTrue(any("re-encoding lossy" in l for l in lines))
+
+    def test_lossless_source_does_not_warn(self):
+        """Transcoding lossless PNG pages does NOT trigger the lossy warning."""
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.png": make_png(), "2.png": make_png(color=(0, 200, 0))})
+        lines: list[str] = []
+        cl.convert(src, self.dir / "out.cbz", "cbz", image_format="jpeg", log=lines.append)
+        self.assertFalse(any("re-encoding lossy" in l for l in lines))
+
+    def test_same_format_is_lossless_passthrough(self):
+        """Forcing the codec a page already uses keeps its bytes unchanged."""
+        raw = make_jpeg(color=(7, 8, 9))
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": raw})
+        dst = self.dir / "out.cbz"
+        lines: list[str] = []
+        cl.convert(src, dst, "cbz", image_format="jpeg", log=lines.append)
+        with zipfile.ZipFile(dst) as z:
+            self.assertEqual(z.read("1.jpg"), raw)  # bytes untouched
+        self.assertFalse(any("re-encoding lossy" in l for l in lines))
+
+    def test_no_image_format_keeps_passthrough(self):
+        """Without image_format, a mixed archive still passes through untouched."""
+        p1, p3 = make_jpeg(), make_png()
+        src = self.dir / "src.cbz"
+        make_cbz(src, {"1.jpg": p1, "2.png": p3})
+        dst = self.dir / "out.cbz"
+        cl.convert(src, dst, "cbz")  # no image_format
+        with zipfile.ZipFile(dst) as z:
+            self.assertEqual(z.namelist(), ["1.jpg", "2.png"])
+            self.assertEqual(z.read("1.jpg"), p1)
+
+    def test_image_format_arg_parsed(self):
+        """--image-format is parsed and defaults to None."""
+        self.assertIsNone(cc.build_parser().parse_args(["s", "d"]).image_format)
+        self.assertEqual(
+            cc.build_parser().parse_args(["s", "d", "--image-format", "webp"]).image_format,
+            "webp",
+        )
+
+
 # ── log callable threading ───────────────────────────────────────────────────
 
 @unittest.skipUnless(HAVE_PIL, "Pillow not installed")
@@ -607,6 +695,73 @@ class TestPdfConversion(unittest.TestCase):
             self.assertEqual(z.namelist(), ["1.jpg", "2.jpg", "3.jpg"])
 
 
+# ── _native_dpi ──────────────────────────────────────────────────────────────
+
+@unittest.skipUnless(cl.fitz is not None and HAVE_PIL, "PyMuPDF/Pillow not installed")
+class TestNativeDpi(unittest.TestCase):
+    """_native_dpi measures the embedded-image resolution of a PDF page."""
+
+    def _make_pdf(self, img_w: int, img_h: int, page_w: float, page_h: float) -> "fitz.Document":
+        """Create a single-page PDF with one image placed full-page."""
+        import fitz
+        doc = fitz.open()
+        page = doc.new_page(width=page_w, height=page_h)
+        img = cl.Image.new("RGB", (img_w, img_h), (128, 64, 32))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        page.insert_image(fitz.Rect(0, 0, page_w, page_h), stream=buf.getvalue())
+        return doc
+
+    def _native(self, img_w, img_h, page_w, page_h):
+        from comic_lib.extract import _native_dpi
+        doc = self._make_pdf(img_w, img_h, page_w, page_h)
+        result = _native_dpi(doc[0])
+        doc.close()
+        return result
+
+    def test_full_page_image_letter(self):
+        """425x550 image on a 612x792 pt letter page → ~50 DPI."""
+        result = self._native(425, 550, 612, 792)
+        self.assertIsNotNone(result)
+        # 425 / (612/72) ≈ 50.0; allow a small float margin
+        self.assertAlmostEqual(result, 50.0, delta=1.0)
+
+    def test_high_res_image(self):
+        """2550x3300 image on letter page → ~300 DPI."""
+        result = self._native(2550, 3300, 612, 792)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 300.0, delta=2.0)
+
+    def test_no_image_returns_none(self):
+        """A page with no embedded raster image returns None."""
+        import fitz
+        from comic_lib.extract import _native_dpi
+        doc = fitz.open()
+        doc.new_page(width=612, height=792)
+        result = _native_dpi(doc[0])
+        doc.close()
+        self.assertIsNone(result)
+
+    def test_takes_max_of_multiple_images(self):
+        """When a page has two images, the higher-res one wins."""
+        import fitz
+        from comic_lib.extract import _native_dpi
+        doc = fitz.open()
+        page = doc.new_page(width=612, height=792)
+        for img_w, img_h, rect in [
+            (425, 550, fitz.Rect(0, 0, 306, 792)),    # left half  ~50 DPI
+            (1275, 1650, fitz.Rect(306, 0, 612, 792)), # right half ~150 DPI
+        ]:
+            img = cl.Image.new("RGB", (img_w, img_h), (0, 0, 0))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            page.insert_image(rect, stream=buf.getvalue())
+        result = _native_dpi(page)
+        doc.close()
+        self.assertIsNotNone(result)
+        self.assertGreater(result, 100.0)  # must pick the 150 DPI image, not the 50 DPI one
+
+
 # ── CBR round-trips (need Pillow + rar/unrar) ────────────────────────────────
 
 @unittest.skipUnless(HAVE_PIL and HAVE_RAR and HAVE_RAR_WRITE,
@@ -635,6 +790,125 @@ class TestCbrConversion(unittest.TestCase):
         with zipfile.ZipFile(back) as z:
             self.assertEqual(z.read("1.jpg"), p1)
             self.assertEqual(z.read("3.png"), p3)
+            self.assertEqual(z.read("ComicInfo.xml"), meta)
+
+
+# ── CBT round-trips (need Pillow) ────────────────────────────────────────────
+
+@unittest.skipUnless(HAVE_PIL, "Pillow not installed")
+class TestCbtConversion(unittest.TestCase):
+    """CBT (TAR) extraction and CBZ round-trip."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _make_cbt(self, path: Path, contents: dict) -> None:
+        import tarfile as _tarfile
+        with _tarfile.open(path, "w") as tf:
+            for name, data in contents.items():
+                info = _tarfile.TarInfo(name=name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+
+    def test_cbt_to_cbz_page_count(self):
+        src = self.dir / "book.cbt"
+        self._make_cbt(src, {f"{i}.jpg": make_jpeg() for i in range(1, 4)})
+        dst = self.dir / "book.cbz"
+        n = cl.convert(src, dst, "cbz")
+        self.assertEqual(n, 3)
+        self.assertTrue(dst.exists() and dst.stat().st_size > 0)
+
+    def test_cbt_pages_sorted_naturally(self):
+        src = self.dir / "book.cbt"
+        self._make_cbt(src, {"2.jpg": make_jpeg(), "10.jpg": make_jpeg(), "1.jpg": make_jpeg()})
+        dst = self.dir / "book.cbz"
+        cl.convert(src, dst, "cbz")
+        with zipfile.ZipFile(dst) as z:
+            self.assertEqual(z.namelist(), ["1.jpg", "2.jpg", "3.jpg"])
+
+    def test_cbz_to_cbt_roundtrip(self):
+        src = self.dir / "book.cbz"
+        make_cbz(src, {f"{i}.jpg": make_jpeg() for i in range(1, 3)})
+        dst = self.dir / "book.cbt"
+        n = cl.convert(src, dst, "cbt")
+        self.assertEqual(n, 2)
+        self.assertTrue(dst.exists() and dst.stat().st_size > 0)
+
+    def test_detect_format_cbt(self):
+        src = self.dir / "book.cbt"
+        self._make_cbt(src, {"1.jpg": make_jpeg()})
+        self.assertEqual(cl.detect_format(src), "cbt")
+
+    def test_cbt_preserves_comicinfo(self):
+        src = self.dir / "book.cbt"
+        meta = b"<ComicInfo/>"
+        self._make_cbt(src, {"1.jpg": make_jpeg(), "ComicInfo.xml": meta})
+        dst = self.dir / "book.cbz"
+        cl.convert(src, dst, "cbz")
+        with zipfile.ZipFile(dst) as z:
+            self.assertIn("ComicInfo.xml", z.namelist())
+            self.assertEqual(z.read("ComicInfo.xml"), meta)
+
+
+# ── CB7 round-trips (need Pillow + py7zr) ────────────────────────────────────
+
+@unittest.skipUnless(HAVE_PIL and cl.py7zr is not None, "Pillow or py7zr not installed")
+class TestCb7Conversion(unittest.TestCase):
+    """CB7 (7-Zip) extraction and CBZ round-trip."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _make_cb7(self, path: Path, contents: dict) -> None:
+        with cl.py7zr.SevenZipFile(path, mode="w") as zf:
+            for name, data in contents.items():
+                zf.writef(io.BytesIO(data), name)
+
+    def test_cb7_to_cbz_page_count(self):
+        src = self.dir / "book.cb7"
+        self._make_cb7(src, {f"{i}.jpg": make_jpeg() for i in range(1, 4)})
+        dst = self.dir / "book.cbz"
+        n = cl.convert(src, dst, "cbz")
+        self.assertEqual(n, 3)
+        self.assertTrue(dst.exists() and dst.stat().st_size > 0)
+
+    def test_cb7_pages_sorted_naturally(self):
+        src = self.dir / "book.cb7"
+        self._make_cb7(src, {"2.jpg": make_jpeg(), "10.jpg": make_jpeg(), "1.jpg": make_jpeg()})
+        dst = self.dir / "book.cbz"
+        cl.convert(src, dst, "cbz")
+        with zipfile.ZipFile(dst) as z:
+            self.assertEqual(z.namelist(), ["1.jpg", "2.jpg", "3.jpg"])
+
+    def test_cbz_to_cb7_roundtrip(self):
+        src = self.dir / "book.cbz"
+        make_cbz(src, {f"{i}.jpg": make_jpeg() for i in range(1, 3)})
+        dst = self.dir / "book.cb7"
+        n = cl.convert(src, dst, "cb7")
+        self.assertEqual(n, 2)
+        self.assertTrue(dst.exists() and dst.stat().st_size > 0)
+
+    def test_detect_format_cb7(self):
+        src = self.dir / "book.cb7"
+        self._make_cb7(src, {"1.jpg": make_jpeg()})
+        self.assertEqual(cl.detect_format(src), "cb7")
+
+    def test_cb7_preserves_comicinfo(self):
+        src = self.dir / "book.cb7"
+        meta = b"<ComicInfo/>"
+        self._make_cb7(src, {"1.jpg": make_jpeg(), "ComicInfo.xml": meta})
+        dst = self.dir / "book.cbz"
+        cl.convert(src, dst, "cbz")
+        with zipfile.ZipFile(dst) as z:
+            self.assertIn("ComicInfo.xml", z.namelist())
             self.assertEqual(z.read("ComicInfo.xml"), meta)
 
 
@@ -848,6 +1122,12 @@ class TestInferFormat(unittest.TestCase):
     def test_from_extension(self):
         self.assertEqual(cc.infer_format(Path("out.cbr"), None), "cbr")
 
+    def test_cbt_from_extension(self):
+        self.assertEqual(cc.infer_format(Path("out.cbt"), None), "cbt")
+
+    def test_cb7_from_extension(self):
+        self.assertEqual(cc.infer_format(Path("out.cb7"), None), "cb7")
+
     def test_unknown_exits(self):
         with self.assertRaises(SystemExit):
             cc.infer_format(Path("out.txt"), None)
@@ -915,8 +1195,10 @@ class TestPageEncoded(unittest.TestCase):
         img = cl.Image.open(io.BytesIO(data))
         self.assertEqual(img.mode, "L")
 
-    def test_l_mode_webp_stays_grey(self):
-        """An L-mode page encoded to WebP stays greyscale (WebP supports L natively)."""
+    def test_l_mode_webp_encodes_as_rgb(self):
+        """An L-mode page encoded to WebP is stored as RGB.
+        Pillow's WebP encoder promotes L to RGB silently; we make this explicit
+        so the round-trip mode is predictable."""
         try:
             page = cl.Page(image=cl.Image.new("L", (32, 32), 200))
             data, ext = page.encoded(85, image_format="webp")
@@ -924,7 +1206,7 @@ class TestPageEncoded(unittest.TestCase):
             self.skipTest("WebP not supported by this Pillow build")
         self.assertEqual(ext, ".webp")
         img = cl.Image.open(io.BytesIO(data))
-        self.assertEqual(img.mode, "L")
+        self.assertEqual(img.mode, "RGB")
 
 
 # ── Page.is_greyscale() ─────────────────────────────────────────────────────
@@ -958,7 +1240,7 @@ class TestPageIsGreyscale(unittest.TestCase):
 @unittest.skipUnless(HAVE_PIL and cl.fitz is not None,
                      "PyMuPDF or Pillow not installed")
 class TestPdfImageFormat(unittest.TestCase):
-    """PDF -> CBZ with --pdf-image-format jpeg/png/webp produces correctly-typed pages."""
+    """PDF -> CBZ with --image-format jpeg/png/webp produces correctly-typed pages."""
 
     def setUp(self):
         self.tmp = TemporaryDirectory()
@@ -974,7 +1256,7 @@ class TestPdfImageFormat(unittest.TestCase):
 
     def _convert_and_read_page(self, image_format: str):
         dst = self.dir / f"out_{image_format}.cbz"
-        cl.convert(self.pdf, dst, "cbz", pdf_dpi=72, pdf_image_format=image_format)
+        cl.convert(self.pdf, dst, "cbz", pdf_dpi=72, image_format=image_format)
         with zipfile.ZipFile(dst) as z:
             name = z.namelist()[0]
             return cl.Image.open(io.BytesIO(z.read(name)))
@@ -998,7 +1280,7 @@ class TestPdfImageFormat(unittest.TestCase):
         """pdf_color_mode='greyscale' forces all pages to L-mode."""
         dst = self.dir / "grey_out.cbz"
         cl.convert(self.pdf, dst, "cbz", pdf_dpi=72, pdf_color_mode="greyscale",
-                   pdf_image_format="png")
+                   image_format="png")
         with zipfile.ZipFile(dst) as z:
             name = z.namelist()[0]
             img = cl.Image.open(io.BytesIO(z.read(name)))
@@ -1013,19 +1295,19 @@ class TestPdfImageFormat(unittest.TestCase):
 
         dst = self.dir / "auto_grey_out.cbz"
         cl.convert(grey_pdf, dst, "cbz", pdf_dpi=72, pdf_color_mode="auto",
-                   pdf_image_format="png")
+                   image_format="png")
         with zipfile.ZipFile(dst) as z:
             name = z.namelist()[0]
             img = cl.Image.open(io.BytesIO(z.read(name)))
         self.assertIn(img.mode, ("L", "RGB"))  # L when auto detects grey
 
-    def test_pdf_image_format_only_applies_to_pdf_source(self):
-        """Converting CBZ->CBZ ignores pdf_image_format; passthrough is used."""
+    def test_archive_without_image_format_uses_passthrough(self):
+        """CBZ->CBZ without --image-format keeps original page bytes (no re-encoding)."""
         src = self.dir / "passthrough_src.cbz"
         raw_jpeg = make_jpeg()
         make_cbz(src, {"1.jpg": raw_jpeg})
         dst = self.dir / "passthrough_dst.cbz"
-        cl.convert(src, dst, "cbz", pdf_image_format="png")  # should NOT re-encode as PNG
+        cl.convert(src, dst, "cbz")  # no image_format → passthrough
         with zipfile.ZipFile(dst) as z:
             self.assertEqual(z.namelist(), ["1.jpg"])  # still .jpg
 
@@ -1033,7 +1315,7 @@ class TestPdfImageFormat(unittest.TestCase):
         """pdf_color_mode='greyscale' + png produces L-mode PNG pages (not RGB)."""
         dst = self.dir / "grey_png.cbz"
         cl.convert(self.pdf, dst, "cbz", pdf_dpi=72,
-                   pdf_color_mode="greyscale", pdf_image_format="png")
+                   pdf_color_mode="greyscale", image_format="png")
         with zipfile.ZipFile(dst) as z:
             img = cl.Image.open(io.BytesIO(z.read(z.namelist()[0])))
         self.assertEqual(img.mode, "L")

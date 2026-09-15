@@ -1,15 +1,6 @@
 """Core: exception, helpers, constants, and all optional imports."""
 
-import io
-import os
-import re
-import shutil
-import subprocess
-import tempfile
-import zipfile
-from contextlib import contextmanager
-from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
@@ -41,10 +32,15 @@ try:
 except ImportError:
     np = None  # type: ignore[assignment]
 
+try:
+    import py7zr
+except ImportError:
+    py7zr = None  # type: ignore[assignment]
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
-SUPPORTED_INPUT_EXTS = {".cbr", ".cbz", ".pdf"}
+SUPPORTED_INPUT_EXTS = {".cbr", ".cbz", ".pdf", ".cbt", ".cb7"}
 PASSTHROUGH_EXTS = {".jpg", ".jpeg", ".png"}
 ARCHIVE_PASSTHROUGH_EXTS = PASSTHROUGH_EXTS | {".webp"}
 _ZIP_STORED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}

@@ -1,12 +1,13 @@
 """Archive and PDF extraction functions."""
 
+import tarfile
 import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from ._core import (
     ConversionError, require,
-    rarfile, fitz, Image, np,
+    rarfile, fitz, Image, np, py7zr,
     SUPPORTED_IMAGE_EXTS, METADATA_NAMES,
 )
 from ._rar import UNRAR_TOOL, RAR_TOOL, can_read_rar
@@ -15,7 +16,7 @@ from .page import Page, natural_key
 
 # ── Membership filters ────────────────────────────────────────────────────────
 
-def _is_junk(name: str) -> bool:
+def is_junk(name: str) -> bool:
     """True for archive members that should be discarded on a rewrite."""
     if name.endswith("/"):
         return True
@@ -29,16 +30,16 @@ def _is_junk(name: str) -> bool:
     return False
 
 
-def _is_page_entry(name: str) -> bool:
+def is_page_entry(name: str) -> bool:
     """True for real image pages."""
-    if _is_junk(name):
+    if is_junk(name):
         return False
     return Path(name).suffix.lower() in SUPPORTED_IMAGE_EXTS
 
 
-def _is_preservable_extra(name: str) -> bool:
+def is_preservable_extra(name: str) -> bool:
     """True for a root-level reader-metadata member (ComicInfo.xml)."""
-    if _is_junk(name):
+    if is_junk(name):
         return False
     if name != Path(name).name:
         return False
@@ -50,7 +51,7 @@ def _is_preservable_extra(name: str) -> bool:
 def _extract_archive(names, reader, kind: str, strict: bool = False, log=print) -> list[Page]:
     """Turn archive entries into ordered Pages."""
     image_names = sorted(
-        (n for n in names if _is_page_entry(n)),
+        (n for n in names if is_page_entry(n)),
         key=natural_key,
     )
     if not image_names:
@@ -101,60 +102,179 @@ def extract_from_cbr(path: Path, log=print) -> list[Page]:
         raise ConversionError(f"could not open CBR '{path.name}': {e}")
 
 
+def extract_from_cbt(path: Path, log=print) -> list[Page]:
+    """Extract ordered Pages from a CBT (TAR) archive."""
+    try:
+        with tarfile.open(path) as tf:
+            members = {m.name: m for m in tf.getmembers() if is_page_entry(m.name)}
+            image_names = sorted(members, key=natural_key)
+            if not image_names:
+                raise ConversionError(f"no image pages found in CBT '{path.name}'")
+            pages: list[Page] = []
+            for name in image_names:
+                try:
+                    f = tf.extractfile(members[name])
+                    if f is None:
+                        raise ConversionError("not a regular file")
+                    pages.append(Page(data=f.read(), ext=Path(name).suffix))
+                except Exception as e:
+                    log(f"  Warning: could not read '{name}': {e}")
+                    pages.append(Page(missing=True))
+            return pages
+    except tarfile.TarError as e:
+        raise ConversionError(f"could not open CBT '{path.name}': {e}")
+
+
+def extract_from_cb7(path: Path, log=print) -> list[Page]:
+    """Extract ordered Pages from a CB7 (7-Zip) archive."""
+    require(py7zr, "py7zr", "pip install py7zr")
+    try:
+        with py7zr.SevenZipFile(path, mode="r") as zf:
+            image_names = sorted(
+                (n for n in zf.getnames() if is_page_entry(n)),
+                key=natural_key,
+            )
+            if not image_names:
+                raise ConversionError(f"no image pages found in CB7 '{path.name}'")
+            # py7zr has no random-access API: read() decompresses all requested
+            # members in one pass. Unlike CBZ/CBR (one page at a time), all page
+            # bytes are in memory simultaneously until the loop below consumes them.
+            extracted = zf.read(image_names)
+            pages: list[Page] = []
+            for name in image_names:
+                try:
+                    bio = extracted.get(name)
+                    if bio is None:
+                        raise ConversionError("file missing from archive")
+                    pages.append(Page(data=bio.read(), ext=Path(name).suffix))
+                except Exception as e:
+                    log(f"  Warning: could not read '{name}': {e}")
+                    pages.append(Page(missing=True))
+            return pages
+    except py7zr.Bad7zFile as e:
+        raise ConversionError(f"could not open CB7 '{path.name}': {e}")
+
+
+def _native_dpi(page) -> Optional[float]:
+    """Highest embedded-image resolution on the page, expressed as a page DPI,
+    or None if the page carries no raster image.
+
+    For each placed image, its own density is its pixel size divided by the
+    physical size of its placement box (points/72 = inches). Rendering the page
+    at that DPI reproduces the image at its native pixel count; going higher only
+    upscales (interpolates) it, inflating output size without adding detail. The
+    max across images preserves the sharpest content on the page."""
+    try:
+        infos = page.get_image_info()
+    except Exception:
+        return None
+    best: Optional[float] = None
+    for info in infos:
+        w = info.get("width", 0)
+        h = info.get("height", 0)
+        bbox = info.get("bbox")
+        if not w or not h or bbox is None:
+            continue
+        bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        if bw <= 0 or bh <= 0:
+            continue
+        cand = max(w / (bw / 72.0), h / (bh / 72.0))
+        if best is None or cand > best:
+            best = cand
+    return best
+
+
 def extract_from_pdf(
     path: Path,
     dpi: int,
     pdf_color_mode: str = "color",
+    no_upscale: bool = False,
     log=print,
-) -> list[Page]:
-    """Rasterize each PDF page to an image Page at the given dpi.
+) -> Iterator[Page]:
+    """Rasterize each PDF page to an image Page at the given dpi, lazily.
+
+    Yields one Page at a time so callers can encode-and-release each rendered
+    bitmap before the next is decoded, keeping peak memory to a single page
+    instead of the whole document.
 
     pdf_color_mode: "color" (RGB), "greyscale" (L-mode), or "auto" (per-page
-    detection, requires numpy)."""
+    detection, requires numpy).
+
+    no_upscale: when True, clamp each page's render DPI to the native resolution
+    of its embedded image, so scanned pages are never interpolated above the
+    detail the source actually holds (dpi stays the ceiling)."""
     if pdf_color_mode not in ("color", "greyscale", "auto"):
         raise ConversionError(f"unknown pdf_color_mode: '{pdf_color_mode}'")
     require(fitz, "PyMuPDF", "pip install PyMuPDF")
     require(Image, "Pillow", "pip install Pillow")
-    pages: list[Page] = []
-    with fitz.open(str(path)) as doc:
-        mat = fitz.Matrix(dpi / 72, dpi / 72)
-        for i, page in enumerate(doc):
-            try:
-                if pdf_color_mode == "greyscale":
-                    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
-                    img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
-                elif pdf_color_mode == "auto":
-                    require(np, "numpy", "pip install numpy")
-                    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-                    img_rgb = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                    arr = np.asarray(img_rgb)
-                    is_grey = bool(
-                        (arr[:, :, 0] == arr[:, :, 1]).all() and
-                        (arr[:, :, 1] == arr[:, :, 2]).all()
-                    )
-                    img = img_rgb.convert("L") if is_grey else img_rgb
-                else:  # "color"
-                    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-                    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                pages.append(Page(image=img))
-            except Exception as e:
-                log(f"  Warning: could not render PDF page {i + 1}: {e}")
-                pages.append(Page(missing=True))
-    if not pages:
+    if pdf_color_mode == "auto":
+        require(np, "numpy", "pip install numpy")
+    doc = fitz.open(str(path))
+    if doc.page_count == 0:
+        doc.close()
         raise ConversionError("PDF has no pages")
-    return pages
+
+    def _render() -> Iterator[Page]:
+        try:
+            clamped = 0
+            total_pages = doc.page_count
+            for i, page in enumerate(doc):
+                try:
+                    page_dpi = dpi
+                    if no_upscale:
+                        native = _native_dpi(page)
+                        if native is not None and native < dpi:
+                            page_dpi = native
+                            clamped += 1
+                    mat = fitz.Matrix(page_dpi / 72, page_dpi / 72)
+                    if pdf_color_mode == "greyscale":
+                        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+                        img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+                    elif pdf_color_mode == "auto":
+                        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+                        img_rgb = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                        arr = np.asarray(img_rgb)
+                        is_grey = bool(
+                            (arr[:, :, 0] == arr[:, :, 1]).all() and
+                            (arr[:, :, 1] == arr[:, :, 2]).all()
+                        )
+                        img = img_rgb.convert("L") if is_grey else img_rgb
+                    else:  # "color"
+                        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+                        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                    yield Page(image=img)
+                except Exception as e:
+                    log(f"  Warning: could not render PDF page {i + 1}: {e}")
+                    yield Page(missing=True)
+            if no_upscale and clamped:
+                log(f"  --no-upscale: clamped {clamped}/{total_pages} page(s) to native DPI (below {dpi})")
+        finally:
+            doc.close()
+
+    return _render()
+
+
+_7Z_MAGIC = b"7z\xbc\xaf\x27\x1c"
 
 
 def detect_format(path: Path) -> Optional[str]:
-    """Identify the real container from its contents: "cbz", "cbr", "pdf", or None."""
+    """Identify the real container from its contents: "cbz", "cbr", "pdf", "cbt", "cb7", or None."""
     try:
         if zipfile.is_zipfile(path):
             return "cbz"
         if rarfile is not None and rarfile.is_rarfile(path):
             return "cbr"
         with open(path, "rb") as f:
-            if f.read(5) == b"%PDF-":
-                return "pdf"
+            header = f.read(6)
+        if header[:5] == b"%PDF-":
+            return "pdf"
+        if header == _7Z_MAGIC:
+            return "cb7"
+        try:
+            if tarfile.is_tarfile(path):
+                return "cbt"
+        except Exception:
+            pass
     except OSError:
         return None
     return None
@@ -165,6 +285,7 @@ def extract_images(
     pdf_dpi: int,
     strict_cbz: bool = False,
     pdf_color_mode: str = "color",
+    no_upscale: bool = False,
     log=print,
 ) -> list[Page]:
     """Dispatch to the right extractor by detecting the file's real container."""
@@ -175,8 +296,13 @@ def extract_images(
         return extract_from_cbz(path, strict=strict_cbz, log=log)
     if fmt == "cbr":
         return extract_from_cbr(path, log=log)
+    if fmt == "cbt":
+        return extract_from_cbt(path, log=log)
+    if fmt == "cb7":
+        return extract_from_cb7(path, log=log)
     if fmt == "pdf":
-        return extract_from_pdf(path, pdf_dpi, pdf_color_mode=pdf_color_mode, log=log)
+        return extract_from_pdf(path, pdf_dpi, pdf_color_mode=pdf_color_mode,
+                                no_upscale=no_upscale, log=log)
     raise ConversionError(f"unsupported or unrecognized source format: '{path.name}'")
 
 
@@ -184,7 +310,7 @@ def _read_extras(namelist, reader) -> dict[str, bytes]:
     """Collect {name: bytes} for root-level reader-metadata members."""
     extras: dict[str, bytes] = {}
     for name in namelist:
-        if _is_preservable_extra(name):
+        if is_preservable_extra(name):
             try:
                 extras[name] = reader(name)
             except Exception:
@@ -193,7 +319,7 @@ def _read_extras(namelist, reader) -> dict[str, bytes]:
 
 
 def archive_extras(path: Path) -> dict[str, bytes]:
-    """Return preservable reader-metadata (ComicInfo.xml) from a CBZ/CBR."""
+    """Return preservable reader-metadata (ComicInfo.xml) from a CBZ/CBR/CBT/CB7."""
     fmt = detect_format(path) or path.suffix.lower().lstrip(".")
     try:
         if fmt == "cbz":
@@ -204,6 +330,22 @@ def archive_extras(path: Path) -> dict[str, bytes]:
                 return {}
             with rarfile.RarFile(path) as rf:
                 return _read_extras(rf.namelist(), rf.read)
+        if fmt == "cbt":
+            with tarfile.open(path) as tf:
+                extras: dict[str, bytes] = {}
+                for member in tf.getmembers():
+                    if is_preservable_extra(member.name):
+                        f = tf.extractfile(member)
+                        if f:
+                            extras[member.name] = f.read()
+                return extras
+        if fmt == "cb7" and py7zr is not None:
+            with py7zr.SevenZipFile(path, mode="r") as zf:
+                meta = [n for n in zf.getnames() if is_preservable_extra(n)]
+                if not meta:
+                    return {}
+                extracted = zf.read(meta)
+                return {n: bio.read() for n, bio in extracted.items() if bio}
     except Exception:
         return {}
     return {}
